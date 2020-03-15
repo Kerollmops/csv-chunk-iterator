@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::env;
+use rayon::iter::{ParallelBridge, ParallelIterator};
 
 struct IterCsvChunks<'a> {
     chunk_size: usize,
@@ -71,19 +72,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(filepath)?;
     let csv = unsafe { memmap::Mmap::map(&file)? };
 
-    let iter = IterCsvChunks::new(&csv, 10000)?;
+    let iter = IterCsvChunks::new(&csv, 100_000)?;
+    let iter = iter.par_bridge();
 
-    let mut number_of_records = 0;
-    let mut record = csv::ByteRecord::new();
+    let number_of_records: Result<usize, csv::Error> =
+        iter.map(|result| {
+            let mut number_of_records = 0;
+            let mut record = csv::ByteRecord::new();
+            let mut chunk_rdr = result?;
 
-    for result in iter {
-        let mut chunk_rdr = result?;
-        while chunk_rdr.read_byte_record(&mut record)? {
-            number_of_records += 1;
-        }
-    }
+            while chunk_rdr.read_byte_record(&mut record)? {
+                number_of_records += 1;
+            }
 
-    println!("{}", number_of_records);
+            Ok(number_of_records)
+        })
+        .try_reduce(|| 0, |acc, count| Ok(acc + count));
+
+    println!("{}", number_of_records?);
 
     Ok(())
 }
