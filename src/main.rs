@@ -1,30 +1,89 @@
+use std::fs::File;
 use std::env;
-use slice_group_by::StrGroupBy;
 
-fn main() {
+struct IterCsvChunks<'a> {
+    chunk_size: usize,
+    bytes: &'a [u8],
+    headers: csv::ByteRecord,
+    rdr: csv::Reader<&'a [u8]>,
+    last_position: csv::Position,
+}
+
+impl<'a> IterCsvChunks<'a> {
+    fn new(bytes: &'a [u8], chunk_size: usize) -> csv::Result<IterCsvChunks<'a>> {
+        let mut rdr = csv::Reader::from_reader(bytes);
+        let headers = rdr.byte_headers()?.clone();
+        let last_position = rdr.position().clone();
+        Ok(IterCsvChunks { chunk_size, bytes, headers, rdr, last_position })
+    }
+}
+
+impl<'a> Iterator for IterCsvChunks<'a> {
+    type Item = csv::Result<csv::Reader<&'a [u8]>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut record = csv::ByteRecord::new();
+        let mut count = 0;
+        let mut position;
+
+        loop {
+            position = self.rdr.position().clone();
+            match self.rdr.read_byte_record(&mut record) {
+                Ok(true) => (),
+                Ok(false) => break,
+                Err(e) => return Some(Err(e)),
+            };
+
+            count += 1;
+
+            if count == self.chunk_size {
+                let start = self.last_position.byte() as usize;
+                let end = position.byte() as usize;
+                let slice = &self.bytes[start..end];
+
+                self.last_position = position;
+
+                // We create a new reader starting at the given number of records.
+                let mut new_rdr = csv::Reader::from_reader(slice);
+                new_rdr.set_byte_headers(self.headers.clone());
+
+                return Some(Ok(new_rdr));
+            }
+        }
+
+        if count == 0 {
+            None
+        } else {
+            let start = self.last_position.byte() as usize;
+            let end = position.byte() as usize;
+            let slice = &self.bytes[start..end];
+
+            let mut new_rdr = csv::Reader::from_reader(slice);
+            new_rdr.set_byte_headers(self.headers.clone());
+
+            Some(Ok(new_rdr))
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filepath = env::args().nth(1).unwrap();
+    let file = File::open(filepath)?;
+    let csv = unsafe { memmap::Mmap::map(&file)? };
 
-    let mut rdr = csv::Reader::from_path(&filepath).unwrap();
-    let mut number_of_words = 0;
+    let iter = IterCsvChunks::new(&csv, 10000)?;
 
-    for result in rdr.records() {
-        let record = result.unwrap();
+    let mut number_of_records = 0;
+    let mut record = csv::ByteRecord::new();
 
-        let count: usize = record.iter()
-            // We count the number of words in each field.
-            .map(|s| {
-                // We create two groups: spaces and non-spaces.
-                s.linear_group_by_key(|c| c.is_whitespace())
-                    // We ignore the groups composed of spaces.
-                    .filter(|s| !s.chars().nth(0).map_or(true, |c| c.is_whitespace()))
-                    // We now count the number of groups that are not whitespaces.
-                    .count()
-            })
-            // We now sums up the counts of words.
-            .sum();
-
-        number_of_words += count;
+    for result in iter {
+        let mut chunk_rdr = result?;
+        while chunk_rdr.read_byte_record(&mut record)? {
+            number_of_records += 1;
+        }
     }
 
-    println!("We found {} words.", number_of_words);
+    println!("{}", number_of_records);
+
+    Ok(())
 }
